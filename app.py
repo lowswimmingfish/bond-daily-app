@@ -1,553 +1,874 @@
 """
-장기국고채 마켓 데일리 — Streamlit App
-엑셀 업로드 → 데이터 자동 감지 → 분석 결과 표시
+장기국고채 분석 엔진 (bond_engine.py)
+- 데이터 로딩 + 단위 변환
+- 핵심질문 12개 분석 함수
+- 차트 생성
+- 자연어 Q&A 처리
 """
 
-import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import io
+import os
+import re
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-from bond_engine import (
-    load_all_data, run_all_questions, format_report,
-    natural_language_query, setup_korean_font,
-    BOND_SHEETS_ALL, PRINCIPAL_SHEETS_ALL, SHORT_NAMES,
-    q11_spread_box, q4_moving_averages,
-)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  상수
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BOND_SHEETS_30Y = ['30년 26-2','30년 25-7','30년 25-2','30년 24-8','30년 24-2','30년 23-7']
+BOND_SHEETS_50Y = ['50년 24-11','50년 22-12']
+BOND_SHEETS_ALL = BOND_SHEETS_30Y + BOND_SHEETS_50Y
+
+PRINCIPAL_SHEETS_30Y = ['30년 26-2원금','30년 25-7원금','30년 25-2원금','30년 24-8원금','30년 24-2원금','30년 23-7원금']
+PRINCIPAL_SHEETS_50Y = ['50년 24-11원금','50년 22-12원금']
+PRINCIPAL_SHEETS_ALL = PRINCIPAL_SHEETS_30Y + PRINCIPAL_SHEETS_50Y
+
+SHORT_NAMES = {
+    '30년 26-2': '26-2', '30년 25-7': '25-7', '30년 25-2': '25-2',
+    '30년 24-8': '24-8', '30년 24-2': '24-2', '30년 23-7': '23-7',
+    '50년 24-11': '24-11', '50년 22-12': '22-12',
+    '30년 26-2원금': '26-2원금', '30년 25-7원금': '25-7원금',
+    '30년 25-2원금': '25-2원금', '30년 24-8원금': '24-8원금',
+    '30년 24-2원금': '24-2원금', '30년 23-7원금': '23-7원금',
+    '50년 24-11원금': '24-11원금', '50년 22-12원금': '22-12원금',
+}
+
+INVESTORS = ['외국인','은행','보험기금','자산운용(공모)','종금']
+INVESTOR_SHORT = {'외국인':'외국인','은행':'은행','보험기금':'보험','자산운용(공모)':'자산운용','종금':'종금'}
+
+ALL_BOND_NAMES = ['26-2','25-7','25-2','24-8','24-2','23-7','24-11','22-12']
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  페이지 기본 설정
+#  한글 폰트 설정
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-st.set_page_config(
-    page_title="장기국고채 마켓 데일리",
-    page_icon="📊",
-    layout="wide",
-)
 
-setup_korean_font()
+def setup_korean_font():
+    """matplotlib 한글 폰트 자동 설정"""
+    import matplotlib
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    import platform
+
+    system = platform.system()
+    font_found = False
+
+    candidates = []
+    if system == 'Windows':
+        candidates = ['Malgun Gothic', '맑은 고딕', 'NanumGothic', '나눔고딕']
+    elif system == 'Darwin':
+        candidates = ['AppleGothic', 'Apple SD Gothic Neo', 'NanumGothic']
+    else:
+        candidates = ['NanumGothic', 'Noto Sans CJK KR', 'Noto Sans KR', 'UnDotum']
+
+    installed = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in installed:
+            plt.rcParams['font.family'] = name
+            font_found = True
+            break
+
+    if not font_found:
+        search_paths = [
+            os.path.expanduser('~/.fonts'),
+            '/usr/share/fonts',
+            'C:/Windows/Fonts',
+            '/System/Library/Fonts',
+            '/Library/Fonts',
+        ]
+        for sp in search_paths:
+            if not os.path.isdir(sp):
+                continue
+            for root, dirs, files in os.walk(sp):
+                for f in files:
+                    if 'nanum' in f.lower() or 'malgun' in f.lower() or 'notosanscjk' in f.lower():
+                        path = os.path.join(root, f)
+                        fm.fontManager.addfont(path)
+                        prop = fm.FontProperties(fname=path)
+                        plt.rcParams['font.family'] = prop.get_name()
+                        font_found = True
+                        break
+                if font_found:
+                    break
+            if font_found:
+                break
+
+    plt.rcParams['axes.unicode_minus'] = False
+    return font_found
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  세션 상태 초기화
+#  데이터 로딩
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "last_file" not in st.session_state:
-    st.session_state.last_file = None
-if "bonds" not in st.session_state:
-    st.session_state.bonds = None
-if "rates" not in st.session_state:
-    st.session_state.rates = None
-if "available_bonds" not in st.session_state:
-    st.session_state.available_bonds = []
-if "results" not in st.session_state:
-    st.session_state.results = None
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  데이터 로딩 (캐시)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@st.cache_data(show_spinner="엑셀 데이터 로딩 중...")
-def cached_load(file_bytes):
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    try:
-        bonds, rates, issuance = load_all_data(tmp_path)
-    finally:
-        os.unlink(tmp_path)
+def load_sheet(raw, sheet_name):
+    """종목 시트 로딩 + 단위 변환 (→ 억) + 날짜 오름차순"""
+    df = raw[sheet_name].copy()
+    cols = df.iloc[2].tolist()
+    data = df.iloc[3:].copy()
+    data.columns = cols
+    data = data.rename(columns={cols[0]: '일자'})
+    data = data[pd.to_datetime(data['일자'], errors='coerce').notna()].copy()
+    data['일자'] = pd.to_datetime(data['일자'])
+    data = data.sort_values('일자').reset_index(drop=True)
+
+    vol_cols = [c for c in cols if '거래량' in str(c) or '순매수' in str(c)]
+    for c in vol_cols:
+        if c in data.columns:
+            data[c] = pd.to_numeric(data[c], errors='coerce') / 1e8
+
+    for c in ['전일잔량','금일거래','금일상환','금일잔량']:
+        if c in data.columns:
+            data[c] = pd.to_numeric(data[c], errors='coerce') / 100
+
+    if '발행액' in data.columns:
+        data['발행액'] = pd.to_numeric(data['발행액'], errors='coerce') / 10000
+
+    for inv in INVESTORS:
+        c = f'{inv} 잔고수량'
+        if c in data.columns:
+            data[c] = pd.to_numeric(data[c], errors='coerce') / 10000
+
+    for c in data.columns:
+        if c != '일자':
+            data[c] = pd.to_numeric(data[c], errors='coerce')
+
+    data['종목'] = SHORT_NAMES.get(sheet_name, sheet_name)
+    return data
+
+
+def load_rate_sheet(raw, sheet_name):
+    df = raw[sheet_name].copy()
+    cols = df.iloc[2].tolist()
+    data = df.iloc[3:].copy()
+    data.columns = cols
+    data = data.rename(columns={cols[0]: '일자'})
+    data = data[pd.to_datetime(data['일자'], errors='coerce').notna()].copy()
+    data['일자'] = pd.to_datetime(data['일자'])
+    data = data.sort_values('일자').reset_index(drop=True)
+    for c in data.columns:
+        if c != '일자' and not isinstance(c, float):
+            try:
+                data[c] = pd.to_numeric(data[c], errors='coerce')
+            except Exception:
+                pass
+    return data
+
+
+def load_all_data(filepath):
+    raw = pd.read_excel(filepath, sheet_name=None, header=None)
+
+    bonds = {}
+    for s in BOND_SHEETS_ALL + PRINCIPAL_SHEETS_ALL:
+        if s in raw:
+            bonds[SHORT_NAMES[s]] = load_sheet(raw, s)
+
+    rates = {}
+    rate_map = {
+        'KTB10': ('10년국채선물&현물수익률', '국고10년 수익율'),
+        'KTB3': ('3넌국채선물&현물수익률', None),
+        'IRS10': ('원화IRS10년', 'MID종가'),
+        'IRS30': ('원화IRS30년', 'MID종가'),
+        'US10': ('미국 10년', 'MID_Close'),
+        'US30': ('미국 30년', 'MID_Close'),
+        'JP10': ('일본 10년', 'MID_Close'),
+        'JP30': ('일본 30년', 'MID_Close'),
+        'AU10': ('호주 10년', 'MID_Close'),
+        'AU30': ('호주 30년', 'MID_Close'),
+    }
+    for key, (sname, _) in rate_map.items():
+        if sname in raw:
+            rates[key] = load_rate_sheet(raw, sname)
+
+    issuance = None
+    if '국채추가발행' in raw:
+        df = raw['국채추가발행'].copy()
+        cols = df.iloc[2].tolist()
+        data = df.iloc[3:].copy()
+        data.columns = cols
+        data = data[data['발행년월'].notna()].copy()
+        for c in ['발행예정액','낙찰금액','상장잔액','응찰금액']:
+            if c in data.columns:
+                data[c] = pd.to_numeric(data[c], errors='coerce') / 100
+        issuance = data
+
     return bonds, rates, issuance
 
-def get_available_bonds(bonds):
-    """업로드된 엑셀에 실제로 존재하는 종목 리스트 반환"""
-    available = []
-    all_short = [SHORT_NAMES[s] for s in BOND_SHEETS_ALL if s in SHORT_NAMES]
-    for sname in all_short:
-        if sname in bonds and len(bonds[sname]) > 0:
-            available.append(sname)
-    return available
-
-def get_latest_date(bonds, available_bonds):
-    """가장 최신 기준일 반환"""
-    dates = []
-    for b in available_bonds:
-        df = bonds.get(b)
-        if df is not None and len(df) > 0:
-            dates.append(df.iloc[-1]['일자'])
-    if dates:
-        return max(dates).strftime('%Y-%m-%d')
-    return '미상'
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  헤더
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-st.title("📊 장기국고채 마켓 데일리")
-st.caption("엑셀 데이터를 업로드하면 12개 핵심 질문에 자동 답변합니다")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  사이드바 — 파일 업로드 + 자동 감지 옵션
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-with st.sidebar:
-    st.header("⚙️ 설정")
-
-    uploaded = st.file_uploader(
-        "채권 데이터 엑셀 (.xlsx)",
-        type=["xlsx"],
-        help="장기국고채 분석용 엑셀 파일을 업로드하세요"
-    )
-
-    # ── 파일 로딩 ──
-    if uploaded is not None:
-        file_id = uploaded.name + str(uploaded.size)
-        if st.session_state.last_file != file_id:
-            with st.spinner("데이터 분석 중..."):
-                bonds, rates, _ = cached_load(uploaded.read())
-                available = get_available_bonds(bonds)
-                st.session_state.bonds = bonds
-                st.session_state.rates = rates
-                st.session_state.available_bonds = available
-                st.session_state.last_file = file_id
-                st.session_state.results = None  # 설정 변경 시 재계산
-            st.success(f"✅ 종목 {len(available)}개 감지됨")
-
-    bonds = st.session_state.bonds
-    rates = st.session_state.rates
-    available_bonds = st.session_state.available_bonds
-
-    # ── 데이터가 있을 때만 옵션 표시 ──
-    if bonds and available_bonds:
-        st.divider()
-        st.subheader("📌 분석 옵션")
-
-        # 기준 종목 — 엑셀에 있는 것만 표시
-        target_bond = st.selectbox(
-            "기준 종목 (Q2~Q11)",
-            options=available_bonds,
-            index=min(1, len(available_bonds) - 1),  # 두 번째 항목을 기본값으로
-            help="분석 기준이 될 종목을 선택하세요"
-        )
-
-        # Q6 설정
-        st.markdown("**Q6. 대차잔고 월별 추이**")
-        # 실제 데이터 기간으로 최대 개월수 제한
-        df_target = bonds.get(target_bond)
-        max_months = 12
-        if df_target is not None and len(df_target) > 0:
-            months_in_data = df_target['일자'].dt.to_period('M').nunique()
-            max_months = min(12, months_in_data)
-
-        q6_months = st.slider(
-            "조회 개월수",
-            min_value=1, max_value=max_months,
-            value=min(6, max_months),
-            help=f"데이터에 최대 {max_months}개월 존재"
-        )
-        q6_ref_day = st.number_input(
-            "기준 영업일 (월 N번째 영업일)",
-            min_value=1, max_value=23,
-            value=7,
-        )
-
-        # Q12 설정 — 엑셀에 있는 종목만 체크박스로
-        st.markdown("**Q12. 잔고 변화 대상 종목**")
-        q12_targets = []
-        # 30년 종목 우선, 50년 종목 후
-        thirty_yr = [b for b in available_bonds if '원금' not in b and b in ['26-2','25-7','25-2','24-8','24-2','23-7']]
-        fifty_yr = [b for b in available_bonds if '원금' not in b and b in ['24-11','22-12']]
-
-        for b in thirty_yr[:4]:  # 최대 4개 기본 체크
-            checked = st.checkbox(f"30년 {b}", value=True, key=f"q12_{b}")
-            if checked:
-                q12_targets.append(b)
-        for b in fifty_yr:
-            checked = st.checkbox(f"50년 {b}", value=False, key=f"q12_{b}")
-            if checked:
-                q12_targets.append(b)
-
-        if not q12_targets:
-            q12_targets = available_bonds[:2]
-
-        st.divider()
-
-        # ── 분석 실행 버튼 ──
-        run_btn = st.button("🔍 분석 실행", type="primary", use_container_width=True)
-        if run_btn or st.session_state.results is None:
-            with st.spinner("12개 질문 분석 중..."):
-                try:
-                    results = run_all_questions(
-                        bonds, rates,
-                        target=target_bond,
-                        q6_ref_day=q6_ref_day,
-                        q6_months=q6_months,
-                        q12_targets=q12_targets,
-                    )
-                    st.session_state.results = results
-                except Exception as e:
-                    st.error(f"분석 오류: {e}")
-                    st.session_state.results = None
-
-        # 기준일 표시
-        latest = get_latest_date(bonds, available_bonds)
-        st.caption(f"📅 기준일: {latest}")
-
-    else:
-        st.info("👆 엑셀 파일을 업로드하면\n분석 옵션이 나타납니다")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  메인 화면
+#  유틸리티
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-if st.session_state.results is None or bonds is None:
-    # 업로드 전 안내 화면
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("### 📥 1단계\n왼쪽 사이드바에서\n채권 데이터 엑셀 업로드")
-    with col2:
-        st.markdown("### ⚙️ 2단계\n기준 종목·기간 선택 후\n**분석 실행** 클릭")
-    with col3:
-        st.markdown("### 📊 3단계\n분석 결과, 차트,\n리포트 자동 생성")
-    st.stop()
+def box_range(series, window=20):
+    recent = series.dropna().iloc[-window:]
+    return recent.quantile(0.25), recent.quantile(0.75)
 
-results = st.session_state.results
-latest_date = get_latest_date(bonds, available_bonds)
+def position_in_box(value, lower, upper):
+    if upper == lower:
+        return 50.0
+    return round(max(0, min(100, (value - lower) / (upper - lower) * 100)), 1)
 
-# ── 4개 탭 ──
-tab1, tab2, tab3, tab4 = st.tabs(["📋 분석결과", "✏️ 편집가능 리포트", "📈 차트", "💬 추가 질문"])
+def level_text(pos):
+    if pos <= 25: return '하단'
+    elif pos <= 50: return '중하단'
+    elif pos <= 75: return '중상단'
+    else: return '상단'
+
+def moving_avg(series, n):
+    return series.rolling(n, min_periods=1).mean()
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  탭1: 분석결과
+#  핵심질문 12개
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-with tab1:
-    st.subheader(f"📋 분석 결과  |  기준일: {latest_date}  |  기준종목: {target_bond}")
+
+def q1_volatility_top(bonds, n=10):
+    """Q1. 전일대비 변동성 TOP"""
+    results = []
+    metrics = {
+        '금리변동': '민평4사 수익률(산출일) 당일',
+        '전체매수거래량': '전체 매수 거래량',
+        '전체매도거래량': '전체 매도 거래량',
+        '전체순매수거래량': '전체 순매수 거래량',
+        '대차금일거래': '금일거래',
+        '대차금일잔량': '금일잔량',
+    }
+    for inv in INVESTORS:
+        short = INVESTOR_SHORT[inv]
+        metrics[f'{short}매수거래량'] = f'{inv} 매수 거래량'
+        metrics[f'{short}매도거래량'] = f'{inv} 매도 거래량'
+        metrics[f'{short}순매수거래량'] = f'{inv} 순매수 거래량'
+
+    for bname, df in bonds.items():
+        if '원금' in bname or len(df) < 2:
+            continue
+        cur, prev = df.iloc[-1], df.iloc[-2]
+        for label, col in metrics.items():
+            if col not in df.columns:
+                continue
+            c_val, p_val = cur.get(col), prev.get(col)
+            if pd.isna(c_val) or pd.isna(p_val):
+                continue
+            chg = c_val - p_val
+            if abs(chg) < 0.001:
+                continue
+            results.append({
+                '종목': bname, '변수': label, '컬럼': col,
+                '전일값': round(p_val, 2), '당일값': round(c_val, 2),
+                '변동': round(chg, 2), '절대변동': abs(chg),
+            })
+    df_r = pd.DataFrame(results).sort_values('절대변동', ascending=False)
+    return df_r.head(n).to_dict('records')
+
+
+def q2_aggressive_buyers(bonds, target='25-7'):
+    """Q2. 공격적 매수 투자자 순위"""
+    df = bonds.get(target)
+    if df is None or len(df) < 1:
+        return {'종목': target, '순위': []}
+    cur = df.iloc[-1]
+    buyers = []
+    for inv in INVESTORS:
+        buy_col = f'{inv} 매수 거래량'
+        rate_col = f'{inv} 매수 수익률'
+        buy_amt = cur.get(buy_col, np.nan)
+        buy_rate = cur.get(rate_col, np.nan)
+        if pd.notna(buy_amt) and buy_amt > 0:
+            buyers.append({
+                '투자자': INVESTOR_SHORT.get(inv, inv),
+                '매수금액_억': round(buy_amt, 0),
+                '매수수익률': round(buy_rate, 3) if pd.notna(buy_rate) else None,
+            })
+    buyers.sort(key=lambda x: x['매수금액_억'], reverse=True)
+    return {'종목': target, '기준일': cur['일자'], '순위': buyers}
+
+
+def q3_box_position(bonds, target='25-7', window=20):
+    """Q3. 박스권 대비 현재 금리 위치"""
+    df = bonds.get(target)
+    if df is None or len(df) < window:
+        return {}
+    rate_col = '민평4사 수익률(산출일) 당일'
+    series = df[rate_col].dropna()
+    if len(series) == 0:
+        return {}
+    cur = series.iloc[-1]
+    lower, upper = box_range(series, window)
+    pos = position_in_box(cur, lower, upper)
+    return {
+        '종목': target, '현재금리': round(cur, 3),
+        '박스권하단': round(lower, 3), '박스권상단': round(upper, 3),
+        '현재위치': pos, '레벨': level_text(pos),
+    }
+
+
+def q4_moving_averages(bonds, target='25-7'):
+    """Q4. 이동평균금리와 현재 위치"""
+    df = bonds.get(target)
+    if df is None or len(df) < 5:
+        return {}
+    rate_col = '민평4사 수익률(산출일) 당일'
+    series = df[rate_col].dropna()
+    if len(series) == 0:
+        return {}
+    cur = series.iloc[-1]
+    ma5 = moving_avg(series, 5).iloc[-1]
+    ma20 = moving_avg(series, 20).iloc[-1]
+    ma60 = moving_avg(series, 60).iloc[-1]
+
+    df2 = df[['일자', rate_col]].dropna(subset=[rate_col]).copy().reset_index(drop=True)
+    s2 = df2[rate_col]
+    df2['MA5'] = moving_avg(s2, 5)
+    df2['MA20'] = moving_avg(s2, 20)
+    df2['MA60'] = moving_avg(s2, 60)
+
+    return {
+        '종목': target, '기준일': df.iloc[-1]['일자'],
+        '현재금리': round(cur, 3),
+        'MA5': round(ma5, 3), 'MA20': round(ma20, 3), 'MA60': round(ma60, 3),
+        '단기비교': '위' if cur > ma5 else '아래',
+        '중기비교': '위' if cur > ma20 else '아래',
+        '장기비교': '위' if cur > ma60 else '아래',
+        'chart_df': df2.tail(120),
+    }
+
+
+def q5_box_buyers(bonds, target='25-7', window=20):
+    """Q5. 박스권 상·하단 주요 매수 주체"""
+    df = bonds.get(target)
+    if df is None or len(df) < window:
+        return {}
+    rate_col = '민평4사 수익률(산출일) 당일'
+    series = df[rate_col]
+    lower, upper = box_range(series, window)
+    recent = df.tail(window).copy()
+    recent_rate = series.tail(window)
+
+    def best_net_buyer(subset):
+        if subset.empty:
+            return '-', 0, '-', None
+        agg = {}
+        for inv in INVESTORS:
+            col = f'{inv} 순매수 거래량'
+            if col in subset.columns:
+                val = subset[col].sum()
+                if pd.notna(val):
+                    agg[INVESTOR_SHORT.get(inv, inv)] = val
+        if not agg:
+            return '-', 0, '-', None
+        best = max(agg, key=lambda k: agg[k])
+        date_val = subset.iloc[0]['일자'] if len(subset) == 1 else f"최근 {len(subset)}일"
+        rate_val = recent_rate.iloc[subset.index[0] - recent.index[0]] if len(subset) == 1 else None
+        return best, round(agg[best], 0), date_val, rate_val
+
+    top_days = recent[recent_rate.values >= upper]
+    bot_days = recent[recent_rate.values <= lower]
+    t_inv, t_amt, t_date, t_rate = best_net_buyer(top_days)
+    b_inv, b_amt, b_date, b_rate = best_net_buyer(bot_days)
+
+    return {
+        '종목': target, '박스권하단': round(lower, 3), '박스권상단': round(upper, 3),
+        '상단매수주체': t_inv, '상단순매수억': t_amt, '상단날짜': t_date,
+        '하단매수주체': b_inv, '하단순매수억': b_amt, '하단날짜': b_date,
+    }
+
+
+def q6_short_balance_monthly(bonds, target='25-7', n_months=6, ref_day=7):
+    """Q6. 대차잔고비율 월별 추이"""
+    df = bonds.get(target)
+    if df is None or '금일잔량' not in df.columns or '발행액' not in df.columns:
+        return {}
+    df2 = df[['일자','금일잔량','발행액']].dropna().copy()
+    if len(df2) == 0:
+        return {}
+    df2['비율'] = df2['금일잔량'] / df2['발행액'] * 100
+    df2['연월'] = df2['일자'].dt.to_period('M')
+    results = []
+    for period in sorted(df2['연월'].unique())[-n_months:]:
+        mdata = df2[df2['연월'] == period].reset_index(drop=True)
+        idx = min(ref_day - 1, len(mdata) - 1)
+        if idx < 0:
+            continue
+        row = mdata.iloc[idx]
+        results.append({
+            '월': str(period), '날짜': row['일자'].strftime('%Y-%m-%d'),
+            '대차잔고비율': round(row['비율'], 3),
+        })
+    return {'종목': target, '기준영업일': ref_day, '추이': results}
+
+
+def q7_short_balance_speed(bonds, target='25-7', window=20):
+    """Q7. 대차잔고 비율 증감속도 + 박스권"""
+    df = bonds.get(target)
+    if df is None or '금일잔량' not in df.columns:
+        return {}
+    df2 = df.copy()
+
+    # 발행액이 없거나 0이면 비율 계산 불가
+    if '발행액' not in df2.columns:
+        return {}
+    df2['비율'] = df2['금일잔량'] / df2['발행액'] * 100
+
+    # 속도: 금일거래 - 금일상환 (두 컬럼이 없으면 0으로 대체)
+    df2['금일거래'] = df2['금일거래'] if '금일거래' in df2.columns else 0
+    df2['금일상환'] = df2['금일상환'] if '금일상환' in df2.columns else 0
+    df2['속도'] = df2['금일거래'] - df2['금일상환']
+
+    ratio_s = df2['비율'].dropna()
+    speed_s = df2['속도'].dropna()
+
+    # ── 핵심 버그 수정: 빈 시리즈 체크 ──
+    if len(ratio_s) == 0 or len(speed_s) == 0:
+        return {'종목': target, 'error': '대차 데이터 없음'}
+
+    r_cur = ratio_s.iloc[-1]
+    s_cur = speed_s.iloc[-1]
+    r_lo, r_hi = box_range(ratio_s, window)
+    s_lo, s_hi = box_range(speed_s, window)
+
+    return {
+        '종목': target,
+        '현재비율': round(r_cur, 3), '비율박스하단': round(r_lo, 3), '비율박스상단': round(r_hi, 3),
+        '비율위치': position_in_box(r_cur, r_lo, r_hi),
+        '현재속도_억': round(s_cur, 1), '속도박스하단': round(s_lo, 1), '속도박스상단': round(s_hi, 1),
+        '속도위치': position_in_box(s_cur, s_lo, s_hi),
+    }
+
+
+def q8_volume_vs_avg(bonds, target='25-7', window=20):
+    """Q8. 당일 거래량 vs 20일 평균"""
+    df = bonds.get(target)
+    if df is None:
+        return {}
+    vol = df['전체 매수 거래량'].dropna()
+    if len(vol) < 2:
+        return {}
+    cur = vol.iloc[-1]
+    # window보다 데이터가 적어도 있는 데이터로 평균 계산
+    avg_data = vol.iloc[max(0, len(vol)-window-1):-1]
+    if len(avg_data) == 0:
+        return {}
+    avg = avg_data.mean()
+    return {
+        '종목': target, '당일거래량_억': round(cur, 0),
+        '20일평균_억': round(avg, 0), '비율': round(cur / avg * 100, 1) if avg else 0,
+    }
+
+
+def q9_quadrant(bonds, target='25-7', window=20):
+    """Q9. 거래량 × 변동폭 4분면"""
+    df = bonds.get(target)
+    if df is None or len(df) < 3:
+        return {}
+    vol = df['전체 매수 거래량'].dropna()
+    hi_col = '장내국채-고 수익률'
+    lo_col = '장내국채-저 수익률'
+    if hi_col not in df.columns or lo_col not in df.columns:
+        return {}
+    comb = df[['일자', hi_col, lo_col]].dropna().copy()
+    comb['spread_bp'] = (comb[hi_col] - comb[lo_col]) * 100
+    if len(vol) < 2 or len(comb) < 2:
+        return {}
+    cur_vol = vol.iloc[-1]
+    avg_vol = vol.iloc[max(0, len(vol)-window-1):-1].mean()
+    cur_sp = comb['spread_bp'].iloc[-1]
+    avg_sp = comb['spread_bp'].iloc[max(0, len(comb)-window-1):-1].mean()
+    vol_up = cur_vol >= avg_vol
+    sp_up = cur_sp >= avg_sp
+
+    quads = {
+        (True, True): '1사분면 (거래량↑+변동폭↑) — 추세 확인형',
+        (False, True): '2사분면 (거래량↓+변동폭↑) — 변동성 확대형',
+        (True, False): '3사분면 (거래량↑+변동폭↓) — 안정적 강세형',
+        (False, False): '4사분면 (거래량↓+변동폭↓) — 관망·소강형',
+    }
+    return {
+        '종목': target,
+        '당일거래량_억': round(cur_vol, 0), '20일평균거래량_억': round(avg_vol, 0),
+        '거래량증감': '증가' if vol_up else '감소',
+        '당일변동폭bp': round(cur_sp, 1), '20일평균변동폭bp': round(avg_sp, 1),
+        '변동폭증감': '증가' if sp_up else '감소',
+        '4분면': quads[(vol_up, sp_up)],
+    }
+
+
+def q10_principal_issuance(bonds, n_months=6):
+    """Q10. 원금 발행증감 월별 추이"""
+    by_month = {}
+    for sname in ['26-2원금','25-7원금','25-2원금','24-8원금','24-2원금','23-7원금']:
+        df = bonds.get(sname)
+        if df is None or '발행액' not in df.columns:
+            continue
+        t = df[['일자','발행액']].dropna(subset=['발행액']).copy()
+        t['연월'] = t['일자'].dt.to_period('M')
+        for p, g in t.groupby('연월'):
+            val = g['발행액'].iloc[-1]
+            by_month[p] = by_month.get(p, 0) + val
+
+    months = sorted(by_month.keys())[-(n_months+1):]
+    trend = []
+    for i in range(1, len(months)):
+        m, pm = months[i], months[i-1]
+        cur_v, prev_v = by_month[m], by_month[pm]
+        chg = cur_v - prev_v
+        trend.append({
+            '월': str(m),
+            '발행액조': round(cur_v / 10000, 2),
+            '전월대비조': round(chg / 10000, 2),
+        })
+    return {'추이': trend}
+
+
+def q11_spread_box(bonds, rates, target='25-7', window=20):
+    """Q11. 스프레드 박스권 위치"""
+    df = bonds.get(target)
+    if df is None:
+        return {}
+    rate_col = '민평4사 수익률(산출일) 당일'
+    ktb30 = df.set_index('일자')[rate_col].dropna()
+    if len(ktb30) == 0:
+        return {}
+
+    comparisons = [
+        ('국고10년', 'KTB10', '국고10년 수익율'),
+        ('IRS30년', 'IRS30', 'MID종가'),
+        ('미국30년', 'US30', 'MID_Close'),
+        ('일본30년', 'JP30', 'MID_Close'),
+        ('호주30년', 'AU30', 'MID_Close'),
+    ]
+    results = []
+    for label, key, col in comparisons:
+        rdf = rates.get(key)
+        if rdf is None or col not in rdf.columns:
+            continue
+        other = rdf.set_index('일자')[col].dropna()
+        common = ktb30.index.intersection(other.index)
+        if len(common) < window:
+            continue
+        spread = (ktb30[common] - other[common]).sort_index()
+        if len(spread) == 0:
+            continue
+        cur_sp = spread.iloc[-1]
+        lo, hi = box_range(spread, window)
+        pos = position_in_box(cur_sp, lo, hi)
+        results.append({
+            '비교대상': label,
+            '스프레드bp': round(cur_sp * 100, 1),
+            '박스하단bp': round(lo * 100, 1), '박스상단bp': round(hi * 100, 1),
+            '위치': pos, '레벨': level_text(pos),
+            'series': spread.tail(120),
+        })
+    return {'종목': target, '스프레드': results}
+
+
+def q12_balance_changes(bonds, targets=None):
+    """Q12. 투자자별 잔고 변화"""
+    if targets is None:
+        targets = ['26-2','25-7','25-2','24-11']
+    results = []
+    for t in targets:
+        df = bonds.get(t)
+        if df is None or len(df) < 2:
+            continue
+        cur, prev = df.iloc[-1], df.iloc[-2]
+        changes = []
+        for inv in INVESTORS:
+            col = f'{inv} 잔고수량'
+            if col not in df.columns:
+                continue
+            c_val, p_val = cur.get(col, np.nan), prev.get(col, np.nan)
+            if pd.isna(c_val) or pd.isna(p_val):
+                continue
+            chg = c_val - p_val
+            changes.append({'투자자': INVESTOR_SHORT.get(inv, inv), '잔고변화_억': round(chg, 2)})
+        changes.sort(key=lambda x: abs(x['잔고변화_억']), reverse=True)
+        results.append({'종목': t, '투자자별': changes})
+    return results
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  전체 분석 실행
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_all_questions(bonds, rates, target='25-7',
+                      q6_ref_day=7, q6_months=6,
+                      q12_targets=None):
+    """12개 질문 전부 실행 → dict 반환"""
+    if q12_targets is None:
+        q12_targets = ['26-2','25-7','25-2','24-11']
+    return {
+        'Q1': q1_volatility_top(bonds),
+        'Q2': q2_aggressive_buyers(bonds, target),
+        'Q3': q3_box_position(bonds, target),
+        'Q4': q4_moving_averages(bonds, target),
+        'Q5': q5_box_buyers(bonds, target),
+        'Q6': q6_short_balance_monthly(bonds, target, q6_months, q6_ref_day),
+        'Q7': q7_short_balance_speed(bonds, target),
+        'Q8': q8_volume_vs_avg(bonds, target),
+        'Q9': q9_quadrant(bonds, target),
+        'Q10': q10_principal_issuance(bonds),
+        'Q11': q11_spread_box(bonds, rates, target),
+        'Q12': q12_balance_changes(bonds, q12_targets),
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  텍스트 리포트 생성 (편집 가능 기본 초안)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def format_report(results, base_date=None):
+    """12개 질문 결과를 한글 텍스트 리포트로 변환"""
+    lines = []
+    lines.append(f"━━ 장기국고채 마켓 데일리 ━━  기준일: {base_date or '미정'}\n")
 
     # Q1
-    with st.expander("Q1. 전일대비 변동성 TOP10", expanded=True):
-        q1 = results.get('Q1', [])
-        if q1:
-            df_q1 = pd.DataFrame(q1)[['종목','변수','전일값','당일값','변동']]
-            df_q1.index = range(1, len(df_q1)+1)
-            st.dataframe(df_q1, use_container_width=True)
-        else:
-            st.info("데이터 없음")
+    lines.append("■ Q1. 전일대비 변동성 TOP10")
+    for i, r in enumerate(results.get('Q1', []), 1):
+        chg = r['변동']
+        sign = '+' if chg > 0 else ''
+        lines.append(f"  {i}. {r['종목']} {r['변수']}: {sign}{chg:,.1f}억")
+    lines.append("")
 
-    col_a, col_b = st.columns(2)
+    # Q2
+    q2 = results.get('Q2', {})
+    lines.append(f"■ Q2. 공격적 매수 투자자 — {q2.get('종목','')}")
+    for i, b in enumerate(q2.get('순위', []), 1):
+        rate_str = f", 평균 {b['매수수익률']:.3f}%" if b['매수수익률'] else ""
+        lines.append(f"  {i}. {b['투자자']}: {b['매수금액_억']:,.0f}억 매수{rate_str}")
+    lines.append("")
 
-    with col_a:
-        # Q2
-        with st.expander("Q2. 공격적 매수 투자자", expanded=True):
-            q2 = results.get('Q2', {})
-            buyers = q2.get('순위', [])
-            if buyers:
-                df_q2 = pd.DataFrame(buyers)
-                df_q2.index = range(1, len(df_q2)+1)
-                st.dataframe(df_q2, use_container_width=True)
-            else:
-                st.info("매수 거래 없음")
+    # Q3
+    q3 = results.get('Q3', {})
+    lines.append(f"■ Q3. 20일 박스권 위치 — {q3.get('종목','')}")
+    lines.append(f"  현재 금리: {q3.get('현재금리',0):.3f}%")
+    lines.append(f"  박스권: {q3.get('박스권하단',0):.3f}% ~ {q3.get('박스권상단',0):.3f}%")
+    lines.append(f"  위치: {q3.get('레벨','-')}에서 {q3.get('현재위치',0):.1f}%")
+    lines.append("")
 
-        # Q3
-        with st.expander("Q3. 20일 박스권 위치", expanded=True):
-            q3 = results.get('Q3', {})
-            if q3:
-                pos = q3.get('현재위치', 0)
-                st.metric("현재 금리", f"{q3.get('현재금리',0):.3f}%")
-                col_i, col_ii = st.columns(2)
-                col_i.metric("박스 하단", f"{q3.get('박스권하단',0):.3f}%")
-                col_ii.metric("박스 상단", f"{q3.get('박스권상단',0):.3f}%")
-                st.progress(int(pos), text=f"{q3.get('레벨','-')} | {pos:.1f}%")
-            else:
-                st.info("데이터 부족 (최소 20일)")
-
-        # Q5
-        with st.expander("Q5. 박스권 상·하단 매수 주체", expanded=False):
-            q5 = results.get('Q5', {})
-            if q5:
-                c1, c2 = st.columns(2)
-                c1.metric("상단 매수 주체", q5.get('상단매수주체','-'),
-                          f"{q5.get('상단순매수억',0):+,.0f}억")
-                c2.metric("하단 매수 주체", q5.get('하단매수주체','-'),
-                          f"{q5.get('하단순매수억',0):+,.0f}억")
-            else:
-                st.info("데이터 없음")
-
-    with col_b:
-        # Q4
-        with st.expander("Q4. 이동평균 금리 위치", expanded=True):
-            q4 = results.get('Q4', {})
-            if q4:
-                cur = q4.get('현재금리', 0)
-                ma5 = q4.get('MA5', 0)
-                ma20 = q4.get('MA20', 0)
-                ma60 = q4.get('MA60', 0)
-                st.metric("현재 금리", f"{cur:.3f}%")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("MA5 (단기)", f"{ma5:.3f}%",
-                          f"{'▲ 위' if cur > ma5 else '▼ 아래'}")
-                c2.metric("MA20 (중기)", f"{ma20:.3f}%",
-                          f"{'▲ 위' if cur > ma20 else '▼ 아래'}")
-                c3.metric("MA60 (장기)", f"{ma60:.3f}%",
-                          f"{'▲ 위' if cur > ma60 else '▼ 아래'}")
-            else:
-                st.info("데이터 부족 (최소 5일)")
-
-        # Q6
-        with st.expander("Q6. 대차잔고비율 월별 추이", expanded=True):
-            q6 = results.get('Q6', {})
-            trend = q6.get('추이', [])
-            if trend:
-                df_q6 = pd.DataFrame(trend)
-                df_q6.columns = ['월', '날짜', '대차잔고비율(%)']
-                st.dataframe(df_q6, use_container_width=True)
-            else:
-                st.info("대차 데이터 없음")
-
-        # Q7
-        with st.expander("Q7. 대차잔고 비율·속도 박스권", expanded=False):
-            q7 = results.get('Q7', {})
-            if q7.get('error'):
-                st.warning(q7['error'])
-            elif q7:
-                c1, c2 = st.columns(2)
-                rpos = q7.get('비율위치', 0)
-                spos = q7.get('속도위치', 0)
-                c1.metric("현재 비율", f"{q7.get('현재비율',0):.3f}%")
-                c1.progress(int(rpos), text=f"비율 박스 위치: {rpos:.1f}%")
-                c2.metric("증감 속도", f"{q7.get('현재속도_억',0):+.1f}억")
-                c2.progress(int(spos), text=f"속도 박스 위치: {spos:.1f}%")
-            else:
-                st.info("데이터 없음")
-
-    # Q8, Q9 나란히
-    col_c, col_d = st.columns(2)
-    with col_c:
-        with st.expander("Q8. 당일 거래량 vs 20일 평균", expanded=False):
-            q8 = results.get('Q8', {})
-            if q8:
-                ratio = q8.get('비율', 0)
-                st.metric("당일 거래량", f"{q8.get('당일거래량_억',0):,.0f}억",
-                          f"20일평균 {q8.get('20일평균_억',0):,.0f}억 대비 {ratio:.1f}%")
-                st.progress(min(100, int(ratio)), text=f"{ratio:.1f}%")
-            else:
-                st.info("데이터 없음")
-
-    with col_d:
-        with st.expander("Q9. 거래량×변동폭 4분면", expanded=False):
-            q9 = results.get('Q9', {})
-            if q9:
-                st.info(f"**{q9.get('4분면','-')}**")
-                c1, c2 = st.columns(2)
-                c1.metric("거래량", q9.get('거래량증감','-'))
-                c2.metric("변동폭", q9.get('변동폭증감','-'))
-            else:
-                st.info("데이터 없음")
-
-    # Q10, Q11, Q12
-    with st.expander("Q10. 원금 발행증감 월별 추이", expanded=False):
-        q10 = results.get('Q10', {})
-        trend10 = q10.get('추이', [])
-        if trend10:
-            df_q10 = pd.DataFrame(trend10)
-            df_q10.columns = ['월', '발행액(조)', '전월대비(조)']
-            st.dataframe(df_q10, use_container_width=True)
-        else:
-            st.info("원금 데이터 없음")
-
-    with st.expander("Q11. 스프레드 박스권 위치", expanded=False):
-        q11 = results.get('Q11', {})
-        spreads = q11.get('스프레드', [])
-        if spreads:
-            rows = [{
-                '비교대상': s['비교대상'],
-                '스프레드(bp)': f"{s['스프레드bp']:+.1f}",
-                '박스하단': f"{s['박스하단bp']:+.1f}",
-                '박스상단': f"{s['박스상단bp']:+.1f}",
-                '레벨': s['레벨'],
-                '위치(%)': f"{s['위치']:.1f}",
-            } for s in spreads]
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        else:
-            st.info("스프레드 데이터 없음 (금리 시트 필요)")
-
-    with st.expander("Q12. 투자자별 잔고 변화", expanded=False):
-        q12 = results.get('Q12', [])
-        if q12:
-            for bond_data in q12:
-                st.markdown(f"**{bond_data['종목']}**")
-                df_12 = pd.DataFrame(bond_data['투자자별'])
-                if not df_12.empty:
-                    df_12.columns = ['투자자', '잔고변화(억)']
-                    st.dataframe(df_12, use_container_width=True)
-        else:
-            st.info("잔고 데이터 없음")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  탭2: 편집 가능 리포트
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-with tab2:
-    st.subheader("✏️ 편집 가능 리포트")
-    st.caption("아래 텍스트를 직접 수정한 후 복사하거나 다운로드하세요")
-
-    report_text = format_report(results, base_date=latest_date)
-
-    edited = st.text_area(
-        "리포트 (자유롭게 편집)",
-        value=report_text,
-        height=600,
-        key="report_editor",
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            "⬇️ 텍스트 파일로 다운로드",
-            data=edited.encode('utf-8'),
-            file_name=f"마켓데일리_{latest_date}.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
-    with col2:
-        if st.button("🔄 원본으로 초기화", use_container_width=True):
-            st.rerun()
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  탭3: 차트
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-with tab3:
-    st.subheader("📈 차트")
-
-    # ── Q4 차트: 금리 + 이동평균 ──
-    st.markdown(f"#### Q4. {target_bond} 금리 이동평균선")
+    # Q4
     q4 = results.get('Q4', {})
-    chart_df = q4.get('chart_df')
+    lines.append(f"■ Q4. 이동평균금리 위치 — {q4.get('종목','')}")
+    lines.append(f"  현재: {q4.get('현재금리',0):.3f}%  |  MA5: {q4.get('MA5',0):.3f}%({q4.get('단기비교','')})  MA20: {q4.get('MA20',0):.3f}%({q4.get('중기비교','')})  MA60: {q4.get('MA60',0):.3f}%({q4.get('장기비교','')})")
+    lines.append("")
 
-    if chart_df is not None and len(chart_df) > 0:
-        fig, ax = plt.subplots(figsize=(12, 4))
-        rate_col = '민평4사 수익률(산출일) 당일'
-        x = range(len(chart_df))
-        labels = chart_df['일자'].dt.strftime('%m/%d').tolist()
+    # Q5
+    q5 = results.get('Q5', {})
+    lines.append(f"■ Q5. 박스권 상·하단 매수 주체 — {q5.get('종목','')}")
+    lines.append(f"  상단({q5.get('박스권상단',0):.3f}%): {q5.get('상단매수주체','-')} 순매수 {q5.get('상단순매수억',0):+,.0f}억")
+    lines.append(f"  하단({q5.get('박스권하단',0):.3f}%): {q5.get('하단매수주체','-')} 순매수 {q5.get('하단순매수억',0):+,.0f}억")
+    lines.append("")
 
-        ax.plot(x, chart_df[rate_col], color='#1f77b4', linewidth=1.5, label='Yield')
-        ax.plot(x, chart_df['MA5'],  color='#ff7f0e', linewidth=1.2, linestyle='--', label='MA5 (5D)')
-        ax.plot(x, chart_df['MA20'], color='#2ca02c', linewidth=1.2, linestyle='--', label='MA20 (20D)')
-        ax.plot(x, chart_df['MA60'], color='#d62728', linewidth=1.2, linestyle='--', label='MA60 (60D)')
+    # Q6
+    q6 = results.get('Q6', {})
+    lines.append(f"■ Q6. 대차잔고비율 월별 추이 — {q6.get('종목','')} (영업일 {q6.get('기준영업일','-')}일차)")
+    for t in q6.get('추이', []):
+        lines.append(f"  {t['월']} ({t['날짜']}): {t['대차잔고비율']:.3f}%")
+    lines.append("")
 
-        # 마지막 값 표시
-        last_idx = len(chart_df) - 1
-        last_val = chart_df[rate_col].iloc[-1]
-        ax.annotate(f'{last_val:.3f}%', xy=(last_idx, last_val),
-                    xytext=(last_idx - 5, last_val + 0.003),
-                    fontsize=8, color='#1f77b4')
-
-        # x축 레이블 (20개만)
-        tick_step = max(1, len(x) // 20)
-        ax.set_xticks(x[::tick_step])
-        ax.set_xticklabels(labels[::tick_step], rotation=45, fontsize=7)
-        ax.set_ylabel('Yield (%)', fontsize=9)
-        ax.set_title(f'KTB 30Y {target_bond} — Yield & Moving Averages', fontsize=10)
-        ax.legend(fontsize=8, loc='upper left')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=130)
-        buf.seek(0)
-        st.image(buf, use_container_width=True)
-        plt.close(fig)
-
-        st.download_button("⬇️ Q4 차트 다운로드 (PNG)",
-                           data=buf.getvalue(),
-                           file_name=f"Q4_MA_{target_bond}_{latest_date}.png",
-                           mime="image/png")
+    # Q7
+    q7 = results.get('Q7', {})
+    if q7.get('error'):
+        lines.append(f"■ Q7. 대차잔고 비율·속도 박스권 — {q7.get('종목','')} ({q7.get('error','')})")
     else:
-        st.info("이동평균 데이터가 부족합니다 (최소 5일)")
+        lines.append(f"■ Q7. 대차잔고 비율·속도 박스권 — {q7.get('종목','')}")
+        lines.append(f"  비율: {q7.get('현재비율',0):.3f}%  박스 {q7.get('비율박스하단',0):.3f}%~{q7.get('비율박스상단',0):.3f}%  위치 {q7.get('비율위치',0):.1f}%")
+        lines.append(f"  속도: {q7.get('현재속도_억',0):+,.1f}억  박스 {q7.get('속도박스하단',0):+,.1f}~{q7.get('속도박스상단',0):+,.1f}억  위치 {q7.get('속도위치',0):.1f}%")
+    lines.append("")
 
-    st.divider()
+    # Q8
+    q8 = results.get('Q8', {})
+    lines.append(f"■ Q8. 당일 거래량 — {q8.get('종목','')}")
+    lines.append(f"  당일 {q8.get('당일거래량_억',0):,.0f}억 / 20일평균 {q8.get('20일평균_억',0):,.0f}억 = {q8.get('비율',0):.1f}%")
+    lines.append("")
 
-    # ── Q11 차트: 스프레드 박스권 ──
-    st.markdown(f"#### Q11. {target_bond} 스프레드 박스권 위치")
+    # Q9
+    q9 = results.get('Q9', {})
+    lines.append(f"■ Q9. 거래량×변동폭 4분면 — {q9.get('종목','')}")
+    lines.append(f"  거래량 {q9.get('거래량증감','-')} / 변동폭 {q9.get('변동폭증감','-')}")
+    lines.append(f"  → {q9.get('4분면','-')}")
+    lines.append("")
+
+    # Q10
+    q10 = results.get('Q10', {})
+    lines.append("■ Q10. 국고30년 원금 발행증감 (최근 6개월)")
+    for t in q10.get('추이', []):
+        lines.append(f"  {t['월']}: {t['발행액조']:.2f}조 ({t['전월대비조']:+.2f}조)")
+    lines.append("")
+
+    # Q11
     q11 = results.get('Q11', {})
-    spreads = q11.get('스프레드', [])
+    lines.append(f"■ Q11. 스프레드 박스권 위치 — {q11.get('종목','')}")
+    for s in q11.get('스프레드', []):
+        lines.append(f"  국고30년-{s['비교대상']}: {s['스프레드bp']:+.1f}bp  박스 {s['박스하단bp']:+.1f}~{s['박스상단bp']:+.1f}bp  {s['레벨']} {s['위치']:.1f}%")
+    lines.append("")
 
-    if spreads:
-        n = len(spreads)
-        fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), sharey=False)
-        if n == 1:
-            axes = [axes]
+    # Q12
+    q12 = results.get('Q12', [])
+    lines.append("■ Q12. 투자자별 잔고 변화")
+    for bond_data in q12:
+        lines.append(f"  [{bond_data['종목']}]")
+        for c in bond_data['투자자별']:
+            v = c['잔고변화_억']
+            lines.append(f"    {c['투자자']}: {v:+,.2f}억")
+    lines.append("")
 
-        colors = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd']
+    return '\n'.join(lines)
 
-        for i, (s, ax) in enumerate(zip(spreads, axes)):
-            series = s['series']
-            lo = s['박스하단bp'] / 100
-            hi = s['박스상단bp'] / 100
-            cur = s['스프레드bp'] / 100
-            x = range(len(series))
-            labels = series.index.strftime('%m/%d').tolist()
-
-            ax.plot(x, series.values, color=colors[i % len(colors)], linewidth=1.2, label='Spread')
-            ax.axhline(lo, color='green',  linewidth=1, linestyle=':', label='Box Lo')
-            ax.axhline(hi, color='red',    linewidth=1, linestyle=':', label='Box Hi')
-            ax.axhline(cur, color='black', linewidth=0.8, linestyle='--')
-
-            # 현재 위치 점 표시
-            ax.scatter([len(series)-1], [series.iloc[-1]], color=colors[i % len(colors)], zorder=5, s=30)
-            ax.annotate(f'{s["스프레드bp"]:+.1f}bp', xy=(len(series)-1, series.iloc[-1]),
-                        xytext=(-20, 6), textcoords='offset points', fontsize=7)
-
-            tick_step = max(1, len(x) // 8)
-            ax.set_xticks(x[::tick_step])
-            ax.set_xticklabels(labels[::tick_step], rotation=45, fontsize=6)
-            ax.set_title(f'KTB30Y - {s["비교대상"]}\n{s["레벨"]} ({s["위치"]:.1f}%)', fontsize=8)
-            ax.legend(fontsize=6, loc='upper left')
-            ax.grid(True, alpha=0.3)
-
-        plt.suptitle(f'Spread Box Position — {target_bond}', fontsize=10, y=1.02)
-        plt.tight_layout()
-
-        buf2 = io.BytesIO()
-        fig.savefig(buf2, format='png', dpi=130, bbox_inches='tight')
-        buf2.seek(0)
-        st.image(buf2, use_container_width=True)
-        plt.close(fig)
-
-        st.download_button("⬇️ Q11 차트 다운로드 (PNG)",
-                           data=buf2.getvalue(),
-                           file_name=f"Q11_Spread_{target_bond}_{latest_date}.png",
-                           mime="image/png")
-    else:
-        st.info("스프레드 데이터가 없습니다 (금리 비교 시트 필요)")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  탭4: 추가 질문 (Chat)
+#  자연어 Q&A 엔진
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-with tab4:
-    st.subheader("💬 추가 질문")
-    st.caption("종목명(예: 25-7)이나 키워드(금리, 거래량, 잔고, 대차, 스프레드, 박스권)를 포함해 질문하세요")
 
-    # 채팅 히스토리 표시
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+def natural_language_query(question, bonds, rates, results):
+    """데이터 기반 자연어 질문 응답"""
+    q = question.strip()
 
-    # 입력
-    if prompt := st.chat_input("질문을 입력하세요..."):
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    # 종목 추출
+    found_bond = None
+    for b in ALL_BOND_NAMES:
+        if b in q:
+            found_bond = b
+            break
 
-        with st.chat_message("assistant"):
-            with st.spinner("분석 중..."):
-                answer = natural_language_query(
-                    prompt, bonds, rates, results
-                )
-            st.markdown(f"```\n{answer}\n```")
-        st.session_state.chat_history.append({"role": "assistant", "content": f"```\n{answer}\n```"})
+    # 투자자 추출
+    found_investor = None
+    inv_keywords = {'외국인':'외국인','은행':'은행','보험':'보험기금','자산운용':'자산운용(공모)','종금':'종금'}
+    for short, full in inv_keywords.items():
+        if short in q:
+            found_investor = (short, full)
+            break
 
-    if st.session_state.chat_history:
-        if st.button("대화 초기화", use_container_width=False):
-            st.session_state.chat_history = []
-            st.rerun()
+    # 금리 관련
+    if any(kw in q for kw in ['금리', '수익률', '현재']):
+        target = found_bond or '25-7'
+        df = bonds.get(target)
+        if df is not None and len(df) > 0:
+            cur = df.iloc[-1]
+            rate = cur.get('민평4사 수익률(산출일) 당일')
+            hi = cur.get('장내국채-고 수익률')
+            lo = cur.get('장내국채-저 수익률')
+            date = cur['일자'].strftime('%Y-%m-%d')
+            text = f"[{target}] {date} 기준\n"
+            if pd.notna(rate):
+                text += f"  민평수익률: {rate:.3f}%\n"
+            if pd.notna(hi) and pd.notna(lo):
+                text += f"  장내 고가: {hi:.3f}% / 저가: {lo:.3f}% (변동폭: {(hi-lo)*100:.1f}bp)\n"
+            s = df['민평4사 수익률(산출일) 당일'].dropna()
+            if len(s) > 0:
+                text += f"  MA5: {moving_avg(s,5).iloc[-1]:.3f}%  MA20: {moving_avg(s,20).iloc[-1]:.3f}%  MA60: {moving_avg(s,60).iloc[-1]:.3f}%"
+            return text
+
+    # 거래량 관련
+    if '거래량' in q:
+        target = found_bond or '25-7'
+        df = bonds.get(target)
+        if df is not None and len(df) > 0:
+            cur = df.iloc[-1]
+            date = cur['일자'].strftime('%Y-%m-%d')
+            text = f"[{target}] {date} 거래량\n"
+            text += f"  전체 매수: {cur.get('전체 매수 거래량', 0):,.0f}억\n"
+            text += f"  전체 매도: {cur.get('전체 매도 거래량', 0):,.0f}억\n"
+            text += f"  순매수: {cur.get('전체 순매수 거래량', 0):+,.0f}억\n"
+            if found_investor:
+                short, full = found_investor
+                buy = cur.get(f'{full} 매수 거래량', 0)
+                sell = cur.get(f'{full} 매도 거래량', 0)
+                net = cur.get(f'{full} 순매수 거래량', 0)
+                text += f"\n  [{short}]\n  매수: {buy:,.0f}억 / 매도: {sell:,.0f}억 / 순매수: {net:+,.0f}억"
+            else:
+                text += "\n  투자자별 매수:\n"
+                for inv in INVESTORS:
+                    val = cur.get(f'{inv} 매수 거래량', 0)
+                    if pd.notna(val) and val > 0:
+                        text += f"    {INVESTOR_SHORT[inv]}: {val:,.0f}억\n"
+            return text
+
+    # 잔고 관련
+    if '잔고' in q:
+        target = found_bond or '25-7'
+        df = bonds.get(target)
+        if df is not None and len(df) > 1:
+            cur, prev = df.iloc[-1], df.iloc[-2]
+            date = cur['일자'].strftime('%Y-%m-%d')
+            text = f"[{target}] {date} 잔고 (억 단위)\n"
+            for inv in INVESTORS:
+                col = f'{inv} 잔고수량'
+                c_v = cur.get(col, 0)
+                p_v = prev.get(col, 0)
+                chg = c_v - p_v if pd.notna(c_v) and pd.notna(p_v) else 0
+                text += f"  {INVESTOR_SHORT[inv]}: {c_v:,.1f}억 ({chg:+,.1f}억)\n"
+            return text
+
+    # 대차 관련
+    if '대차' in q:
+        target = found_bond or '25-7'
+        df = bonds.get(target)
+        if df is not None and len(df) > 0:
+            cur = df.iloc[-1]
+            date = cur['일자'].strftime('%Y-%m-%d')
+            bal = cur.get('금일잔량', 0)
+            issue = cur.get('발행액', 0)
+            ratio = bal / issue * 100 if issue and issue > 0 else 0
+            text = f"[{target}] {date} 대차 현황\n"
+            text += f"  금일잔량: {bal:,.1f}억 / 발행액: {issue:,.0f}억\n"
+            text += f"  대차잔고비율: {ratio:.3f}%\n"
+            text += f"  금일거래: {cur.get('금일거래',0):,.1f}억 / 금일상환: {cur.get('금일상환',0):,.1f}억"
+            return text
+
+    # 스프레드 관련
+    if '스프레드' in q:
+        q11 = results.get('Q11', {})
+        if q11:
+            text = f"[{q11.get('종목','')}] 스프레드 현황\n"
+            for s in q11.get('스프레드', []):
+                text += f"  국고30년-{s['비교대상']}: {s['스프레드bp']:+.1f}bp  박스 {s['레벨']} {s['위치']:.1f}%\n"
+            return text
+
+    # 박스권 관련
+    if '박스' in q:
+        target = found_bond or '25-7'
+        r3 = q3_box_position(bonds, target)
+        if r3:
+            return f"[{target}] 20일 박스권\n  하단: {r3['박스권하단']:.3f}% / 상단: {r3['박스권상단']:.3f}%\n  현재: {r3['현재금리']:.3f}% → {r3['레벨']}에서 {r3['현재위치']:.1f}%"
+
+    # 비교 (종목간)
+    if '비교' in q or 'vs' in q.lower():
+        found_bonds = [b for b in ALL_BOND_NAMES if b in q]
+        if len(found_bonds) >= 2:
+            text = "종목 비교:\n"
+            for b in found_bonds:
+                df = bonds.get(b)
+                if df is not None:
+                    cur = df.iloc[-1]
+                    rate = cur.get('민평4사 수익률(산출일) 당일', 0)
+                    vol = cur.get('전체 매수 거래량', 0)
+                    text += f"  [{b}] 금리: {rate:.3f}% / 거래량: {vol:,.0f}억\n"
+            return text
+
+    # 종목 전체 요약
+    if found_bond:
+        df = bonds.get(found_bond)
+        if df is not None:
+            cur = df.iloc[-1]
+            date = cur['일자'].strftime('%Y-%m-%d')
+            rate = cur.get('민평4사 수익률(산출일) 당일', 0)
+            vol = cur.get('전체 매수 거래량', 0)
+            net = cur.get('전체 순매수 거래량', 0)
+            bal = cur.get('금일잔량', 0)
+            issue = cur.get('발행액', 1)
+            ratio = bal / issue * 100 if issue and issue > 0 else 0
+            text = f"[{found_bond}] {date} 종합\n"
+            text += f"  민평수익률: {rate:.3f}%\n"
+            text += f"  거래량: {vol:,.0f}억 / 순매수: {net:+,.0f}억\n"
+            text += f"  대차잔고비율: {ratio:.3f}%\n"
+            best_inv, best_amt = '-', 0
+            for inv in INVESTORS:
+                v = cur.get(f'{inv} 매수 거래량', 0)
+                if pd.notna(v) and v > best_amt:
+                    best_inv, best_amt = INVESTOR_SHORT[inv], v
+            text += f"  최대 매수 주체: {best_inv} ({best_amt:,.0f}억)"
+            return text
+
+    return "질문을 이해하지 못했습니다. 종목명(예: 25-7)이나 키워드(금리, 거래량, 잔고, 대차, 스프레드, 박스권)를 포함해 주세요."
