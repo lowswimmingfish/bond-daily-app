@@ -55,16 +55,14 @@ def setup_korean_font():
     system = platform.system()
     font_found = False
 
-    # 시스템별 한글 폰트 후보
     candidates = []
     if system == 'Windows':
         candidates = ['Malgun Gothic', '맑은 고딕', 'NanumGothic', '나눔고딕']
-    elif system == 'Darwin':  # macOS
+    elif system == 'Darwin':
         candidates = ['AppleGothic', 'Apple SD Gothic Neo', 'NanumGothic']
-    else:  # Linux
+    else:
         candidates = ['NanumGothic', 'Noto Sans CJK KR', 'Noto Sans KR', 'UnDotum']
 
-    # 설치된 폰트 목록에서 매칭
     installed = {f.name for f in fm.fontManager.ttflist}
     for name in candidates:
         if name in installed:
@@ -72,7 +70,6 @@ def setup_korean_font():
             font_found = True
             break
 
-    # 못 찾으면 ttf 파일 직접 검색
     if not font_found:
         search_paths = [
             os.path.expanduser('~/.fonts'),
@@ -295,6 +292,8 @@ def q3_box_position(bonds, target='25-7', window=20):
         return {}
     rate_col = '민평4사 수익률(산출일) 당일'
     series = df[rate_col].dropna()
+    if len(series) == 0:
+        return {}
     cur = series.iloc[-1]
     lower, upper = box_range(series, window)
     pos = position_in_box(cur, lower, upper)
@@ -312,6 +311,8 @@ def q4_moving_averages(bonds, target='25-7'):
         return {}
     rate_col = '민평4사 수익률(산출일) 당일'
     series = df[rate_col].dropna()
+    if len(series) == 0:
+        return {}
     cur = series.iloc[-1]
     ma5 = moving_avg(series, 5).iloc[-1]
     ma20 = moving_avg(series, 20).iloc[-1]
@@ -380,7 +381,9 @@ def q6_short_balance_monthly(bonds, target='25-7', n_months=6, ref_day=7):
     if df is None or '금일잔량' not in df.columns or '발행액' not in df.columns:
         return {}
     df2 = df[['일자','금일잔량','발행액']].dropna().copy()
-    df2['비율'] = df2['금일잔량'] / df2['발행액']  # 단위 보정: 백만/만 → 자동 %
+    if len(df2) == 0:
+        return {}
+    df2['비율'] = df2['금일잔량'] / df2['발행액'] * 100
     df2['연월'] = df2['일자'].dt.to_period('M')
     results = []
     for period in sorted(df2['연월'].unique())[-n_months:]:
@@ -402,12 +405,26 @@ def q7_short_balance_speed(bonds, target='25-7', window=20):
     if df is None or '금일잔량' not in df.columns:
         return {}
     df2 = df.copy()
-    df2['비율'] = df2['금일잔량'] / df2['발행액']  # 단위 보정: 백만/만 → 자동 %
+
+    # 발행액이 없거나 0이면 비율 계산 불가
+    if '발행액' not in df2.columns:
+        return {}
+    df2['비율'] = df2['금일잔량'] / df2['발행액'] * 100
+
+    # 속도: 금일거래 - 금일상환 (두 컬럼이 없으면 0으로 대체)
+    df2['금일거래'] = df2['금일거래'] if '금일거래' in df2.columns else 0
+    df2['금일상환'] = df2['금일상환'] if '금일상환' in df2.columns else 0
     df2['속도'] = df2['금일거래'] - df2['금일상환']
 
     ratio_s = df2['비율'].dropna()
     speed_s = df2['속도'].dropna()
-    r_cur, s_cur = ratio_s.iloc[-1], speed_s.iloc[-1]
+
+    # ── 핵심 버그 수정: 빈 시리즈 체크 ──
+    if len(ratio_s) == 0 or len(speed_s) == 0:
+        return {'종목': target, 'error': '대차 데이터 없음'}
+
+    r_cur = ratio_s.iloc[-1]
+    s_cur = speed_s.iloc[-1]
     r_lo, r_hi = box_range(ratio_s, window)
     s_lo, s_hi = box_range(speed_s, window)
 
@@ -426,10 +443,14 @@ def q8_volume_vs_avg(bonds, target='25-7', window=20):
     if df is None:
         return {}
     vol = df['전체 매수 거래량'].dropna()
-    if len(vol) < window + 1:
+    if len(vol) < 2:
         return {}
     cur = vol.iloc[-1]
-    avg = vol.iloc[-window-1:-1].mean()
+    # window보다 데이터가 적어도 있는 데이터로 평균 계산
+    avg_data = vol.iloc[max(0, len(vol)-window-1):-1]
+    if len(avg_data) == 0:
+        return {}
+    avg = avg_data.mean()
     return {
         '종목': target, '당일거래량_억': round(cur, 0),
         '20일평균_억': round(avg, 0), '비율': round(cur / avg * 100, 1) if avg else 0,
@@ -439,19 +460,21 @@ def q8_volume_vs_avg(bonds, target='25-7', window=20):
 def q9_quadrant(bonds, target='25-7', window=20):
     """Q9. 거래량 × 변동폭 4분면"""
     df = bonds.get(target)
-    if df is None or len(df) < window + 1:
+    if df is None or len(df) < 3:
         return {}
     vol = df['전체 매수 거래량'].dropna()
-    hi = df['장내국채-고 수익률']
-    lo = df['장내국채-저 수익률']
-    comb = pd.DataFrame({'hi': hi, 'lo': lo}).dropna()
-    comb['spread_bp'] = (comb['hi'] - comb['lo']) * 100
+    hi_col = '장내국채-고 수익률'
+    lo_col = '장내국채-저 수익률'
+    if hi_col not in df.columns or lo_col not in df.columns:
+        return {}
+    comb = df[['일자', hi_col, lo_col]].dropna().copy()
+    comb['spread_bp'] = (comb[hi_col] - comb[lo_col]) * 100
     if len(vol) < 2 or len(comb) < 2:
         return {}
     cur_vol = vol.iloc[-1]
-    avg_vol = vol.iloc[-window-1:-1].mean()
+    avg_vol = vol.iloc[max(0, len(vol)-window-1):-1].mean()
     cur_sp = comb['spread_bp'].iloc[-1]
-    avg_sp = comb['spread_bp'].iloc[-window-1:-1].mean()
+    avg_sp = comb['spread_bp'].iloc[max(0, len(comb)-window-1):-1].mean()
     vol_up = cur_vol >= avg_vol
     sp_up = cur_sp >= avg_sp
 
@@ -505,6 +528,8 @@ def q11_spread_box(bonds, rates, target='25-7', window=20):
         return {}
     rate_col = '민평4사 수익률(산출일) 당일'
     ktb30 = df.set_index('일자')[rate_col].dropna()
+    if len(ktb30) == 0:
+        return {}
 
     comparisons = [
         ('국고10년', 'KTB10', '국고10년 수익율'),
@@ -523,6 +548,8 @@ def q11_spread_box(bonds, rates, target='25-7', window=20):
         if len(common) < window:
             continue
         spread = (ktb30[common] - other[common]).sort_index()
+        if len(spread) == 0:
+            continue
         cur_sp = spread.iloc[-1]
         lo, hi = box_range(spread, window)
         pos = position_in_box(cur_sp, lo, hi)
@@ -642,9 +669,12 @@ def format_report(results, base_date=None):
 
     # Q7
     q7 = results.get('Q7', {})
-    lines.append(f"■ Q7. 대차잔고 비율·속도 박스권 — {q7.get('종목','')}")
-    lines.append(f"  비율: {q7.get('현재비율',0):.3f}%  박스 {q7.get('비율박스하단',0):.3f}%~{q7.get('비율박스상단',0):.3f}%  위치 {q7.get('비율위치',0):.1f}%")
-    lines.append(f"  속도: {q7.get('현재속도_억',0):+,.1f}억  박스 {q7.get('속도박스하단',0):+,.1f}~{q7.get('속도박스상단',0):+,.1f}억  위치 {q7.get('속도위치',0):.1f}%")
+    if q7.get('error'):
+        lines.append(f"■ Q7. 대차잔고 비율·속도 박스권 — {q7.get('종목','')} ({q7.get('error','')})")
+    else:
+        lines.append(f"■ Q7. 대차잔고 비율·속도 박스권 — {q7.get('종목','')}")
+        lines.append(f"  비율: {q7.get('현재비율',0):.3f}%  박스 {q7.get('비율박스하단',0):.3f}%~{q7.get('비율박스상단',0):.3f}%  위치 {q7.get('비율위치',0):.1f}%")
+        lines.append(f"  속도: {q7.get('현재속도_억',0):+,.1f}억  박스 {q7.get('속도박스하단',0):+,.1f}~{q7.get('속도박스상단',0):+,.1f}억  위치 {q7.get('속도위치',0):.1f}%")
     lines.append("")
 
     # Q8
@@ -710,8 +740,6 @@ def natural_language_query(question, bonds, rates, results):
             found_investor = (short, full)
             break
 
-    # ── 패턴별 응답 ──
-
     # 금리 관련
     if any(kw in q for kw in ['금리', '수익률', '현재']):
         target = found_bond or '25-7'
@@ -727,9 +755,9 @@ def natural_language_query(question, bonds, rates, results):
                 text += f"  민평수익률: {rate:.3f}%\n"
             if pd.notna(hi) and pd.notna(lo):
                 text += f"  장내 고가: {hi:.3f}% / 저가: {lo:.3f}% (변동폭: {(hi-lo)*100:.1f}bp)\n"
-            # 이동평균
             s = df['민평4사 수익률(산출일) 당일'].dropna()
-            text += f"  MA5: {moving_avg(s,5).iloc[-1]:.3f}%  MA20: {moving_avg(s,20).iloc[-1]:.3f}%  MA60: {moving_avg(s,60).iloc[-1]:.3f}%"
+            if len(s) > 0:
+                text += f"  MA5: {moving_avg(s,5).iloc[-1]:.3f}%  MA20: {moving_avg(s,20).iloc[-1]:.3f}%  MA60: {moving_avg(s,60).iloc[-1]:.3f}%"
             return text
 
     # 거래량 관련
@@ -782,7 +810,7 @@ def natural_language_query(question, bonds, rates, results):
             date = cur['일자'].strftime('%Y-%m-%d')
             bal = cur.get('금일잔량', 0)
             issue = cur.get('발행액', 0)
-            ratio = bal / issue if issue > 0 else 0  # 단위 보정
+            ratio = bal / issue * 100 if issue and issue > 0 else 0
             text = f"[{target}] {date} 대차 현황\n"
             text += f"  금일잔량: {bal:,.1f}억 / 발행액: {issue:,.0f}억\n"
             text += f"  대차잔고비율: {ratio:.3f}%\n"
@@ -830,12 +858,11 @@ def natural_language_query(question, bonds, rates, results):
             net = cur.get('전체 순매수 거래량', 0)
             bal = cur.get('금일잔량', 0)
             issue = cur.get('발행액', 1)
-            ratio = bal / issue if issue > 0 else 0  # 단위 보정
+            ratio = bal / issue * 100 if issue and issue > 0 else 0
             text = f"[{found_bond}] {date} 종합\n"
             text += f"  민평수익률: {rate:.3f}%\n"
             text += f"  거래량: {vol:,.0f}억 / 순매수: {net:+,.0f}억\n"
             text += f"  대차잔고비율: {ratio:.3f}%\n"
-            # 주요 매수자
             best_inv, best_amt = '-', 0
             for inv in INVESTORS:
                 v = cur.get(f'{inv} 매수 거래량', 0)
