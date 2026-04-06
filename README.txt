@@ -47,8 +47,3 @@ Windows/macOS에서는 자동으로 맑은고딕/AppleGothic 사용.
 Linux에서는 아래 설치 후 사용:
   sudo apt install fonts-nanum
 
-
-[문의]
-
-mooniboy@naver.com
-010-5201-6219
